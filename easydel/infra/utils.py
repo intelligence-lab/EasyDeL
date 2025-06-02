@@ -28,6 +28,7 @@ import flax.core
 import jax
 import jax.tree_util
 import numpy as np
+from jax.sharding import NamedSharding, PartitionSpec
 from eformer.escale import with_sharding_constraint
 from einops import rearrange
 from flax import nnx as nn
@@ -360,18 +361,43 @@ def apply_lora_to_layers(
         for path, _ in iter_module_search(model, ParallelLinear):
             if pattern.search(".".join([str(p) for p in path])):
                 base_module: ParallelLinear = get_module_from_path(model=model, path=path)
+                
+                # Get original kernel sharding
+                kernel_sharding = base_module.kernel.sharding
+                mesh = kernel_sharding.mesh
+                kernel_spec = kernel_sharding.spec
+                
+                # Define sharding for LoRA A and LoRA B
+                # lora_a has shape (in_features, lora_rank)
+                # lora_b has shape (lora_rank, out_features)
+                # If kernel_spec is (X, Y), then lora_a is (X, None) and lora_b is (None, Y)
+                lora_a_spec = PartitionSpec(kernel_spec[0], None)
+                lora_b_spec = PartitionSpec(None, kernel_spec[1])
+                
+                lora_a_sharding = NamedSharding(mesh=mesh, spec=lora_a_spec)
+                lora_b_sharding = NamedSharding(mesh=mesh, spec=lora_b_spec)
+
+                new_lora_layer = nn.LoRA(
+                    base_module=base_module,
+                    rngs=rngs,
+                    dtype=base_module.dtype,
+                    param_dtype=base_module.param_dtype,
+                    in_features=base_module.in_features,
+                    lora_rank=lora_rank,
+                    out_features=base_module.out_features,
+                )
+                
+                # Apply sharding to LoRA parameters
+                # Assuming lora_a and lora_b are nn.Variable instances
+                if hasattr(new_lora_layer, 'lora_a') and isinstance(new_lora_layer.lora_a, nn.Variable):
+                    new_lora_layer.lora_a.sharding = lora_a_sharding
+                if hasattr(new_lora_layer, 'lora_b') and isinstance(new_lora_layer.lora_b, nn.Variable):
+                    new_lora_layer.lora_b.sharding = lora_b_sharding
+                
                 set_module_from_path(
                     model=model,
                     path=path,
-                    new_value=nn.LoRA(
-                        base_module=base_module,
-                        rngs=rngs,
-                        dtype=base_module.dtype,
-                        param_dtype=base_module.param_dtype,
-                        in_features=base_module.in_features,
-                        lora_rank=lora_rank,
-                        out_features=base_module.out_features,
-                    ),
+                    new_value=new_lora_layer,
                 )
             pbar.update(1)
 
