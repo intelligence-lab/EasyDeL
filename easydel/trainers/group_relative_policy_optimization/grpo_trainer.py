@@ -379,6 +379,7 @@ class GRPOTrainer(Trainer):
             prompt_ids, prompt_mask = batch["input_ids"], batch["attention_mask"]
 
             with capture_time() as vinference_time_fn:
+                state.model.shard_model()
                 for output in self.vinference.generate(  # noqa
                     input_ids=prompt_ids,
                     attention_mask=prompt_mask,
