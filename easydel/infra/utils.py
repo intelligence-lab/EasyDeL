@@ -26,6 +26,7 @@ from functools import lru_cache, partial
 import flax
 import flax.core
 import jax
+import jax.lax
 import jax.tree_util
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
@@ -362,23 +363,10 @@ def apply_lora_to_layers(
             if pattern.search(".".join([str(p) for p in path])):
                 base_module: ParallelLinear = get_module_from_path(model=model, path=path)
                 
-                # Get original kernel sharding
-                kernel_sharding = base_module.kernel.sharding
-                mesh = kernel_sharding.mesh
-                kernel_spec = kernel_sharding.spec
+                original_kernel_sharding = base_module.kernel.sharding
                 
-                # Define sharding for LoRA A and LoRA B
-                # lora_a has shape (in_features, lora_rank)
-                # lora_b has shape (lora_rank, out_features)
-                # If kernel_spec is (X, Y), then lora_a is (X, None) and lora_b is (None, Y)
-                lora_a_spec = PartitionSpec(kernel_spec[0], None)
-                lora_b_spec = PartitionSpec(None, kernel_spec[1])
-                
-                lora_a_sharding = NamedSharding(mesh=mesh, spec=lora_a_spec)
-                lora_b_sharding = NamedSharding(mesh=mesh, spec=lora_b_spec)
-
                 new_lora_layer = nn.LoRA(
-                    base_module=base_module,
+                    base_module=base_module, # base_module is consumed here
                     rngs=rngs,
                     dtype=base_module.dtype,
                     param_dtype=base_module.param_dtype,
@@ -386,14 +374,36 @@ def apply_lora_to_layers(
                     lora_rank=lora_rank,
                     out_features=base_module.out_features,
                 )
+
+                # Define sharding specs based on the original kernel sharding
+                mesh = original_kernel_sharding.mesh
+                kernel_spec = original_kernel_sharding.spec
                 
-                # Apply sharding to LoRA parameters
-                # Assuming lora_a and lora_b are nn.Variable instances
+                lora_a_spec = PartitionSpec(kernel_spec[0], None)
+                lora_b_spec = PartitionSpec(None, kernel_spec[1])
+                
+                lora_a_sharding = NamedSharding(mesh=mesh, spec=lora_a_spec)
+                lora_b_sharding = NamedSharding(mesh=mesh, spec=lora_b_spec)
+
+                # Apply sharding constraints
                 if hasattr(new_lora_layer, 'lora_a') and isinstance(new_lora_layer.lora_a, nn.Variable):
-                    new_lora_layer.lora_a.sharding = lora_a_sharding
+                    new_lora_layer.lora_a.value = jax.lax.with_sharding_constraint(
+                        new_lora_layer.lora_a.value,
+                        lora_a_sharding
+                    )
                 if hasattr(new_lora_layer, 'lora_b') and isinstance(new_lora_layer.lora_b, nn.Variable):
-                    new_lora_layer.lora_b.sharding = lora_b_sharding
+                    new_lora_layer.lora_b.value = jax.lax.with_sharding_constraint(
+                        new_lora_layer.lora_b.value,
+                        lora_b_sharding
+                    )
                 
+                # Crucially, also re-apply the sharding constraint to the kernel of the base module within the LoRA layer
+                if hasattr(new_lora_layer, 'base_module') and hasattr(new_lora_layer.base_module, 'kernel') and isinstance(new_lora_layer.base_module.kernel, nn.Variable):
+                    new_lora_layer.base_module.kernel.value = jax.lax.with_sharding_constraint(
+                        new_lora_layer.base_module.kernel.value,
+                        original_kernel_sharding
+                    )
+
                 set_module_from_path(
                     model=model,
                     path=path,
