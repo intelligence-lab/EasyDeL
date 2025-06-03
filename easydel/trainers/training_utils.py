@@ -84,6 +84,9 @@ def update_state_respectfully(
     loss_config: LossConfig,
     metrics: LossMetrics,
 ) -> EasyDeLState:
+    graphstate_sharding_rules = state.shardings.graphstate if (
+        hasattr(state, 'shardings') and hasattr(state.shardings, 'graphstate')
+    ) else None
     """
     Updates the state of the model respectfully based on the provided gradients, loss configuration, and metrics.
 
@@ -97,7 +100,7 @@ def update_state_respectfully(
             EasyDeLState: The updated state of the model.
     """
     if FAST_COMPILE:
-        return state.apply_gradients(grads=gradients)
+        new_state_after_apply_grads = state.apply_gradients(grads=gradients)
     else:
 
         def update_fn(args):
@@ -121,8 +124,21 @@ def update_state_respectfully(
                 lambda x: True,
                 None,
             )
-        state = lax.cond(should_update, update_fn, skip_fn, (state, gradients))
-        return state
+        new_state_after_apply_grads = lax.cond(should_update, update_fn, skip_fn, (state, gradients))
+    # MODIFICATION START
+    # If an update happened (i.e., the state object changed) and we have sharding rules:
+    if graphstate_sharding_rules is not None and new_state_after_apply_grads is not state:
+        resharded_graphstate = jax.tree_map(
+            lambda param, sharding_spec: jax.device_put(param, sharding_spec) if isinstance(sharding_spec, jax.sharding.NamedSharding) else param,
+            new_state_after_apply_grads.graphstate, # Parameters from the *new* state
+            graphstate_sharding_rules               # Sharding rules from the *original* state's definition
+        )
+        final_state = new_state_after_apply_grads.replace(graphstate=resharded_graphstate)
+    else:
+        final_state = new_state_after_apply_grads
+    # MODIFICATION END
+
+    return final_state
 
 
 def minibatch_call(
