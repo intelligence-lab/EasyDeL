@@ -166,18 +166,6 @@ def grpo_step(
                 gradients=gradients,
             ),
         )
-        # MODIFICATION START
-        # Re-apply sharding to the newly updated graphstate to ensure consistency,
-        # especially for LoRA parameters whose sharding might be lost after optimizer update.
-        # This uses the sharding rules defined in state.shardings.graphstate.
-        if hasattr(state, 'shardings') and hasattr(state.shardings, 'graphstate'):
-            resharded_graphstate = jax.tree_map(
-                lambda param, sharding_spec: jax.device_put(param, sharding_spec) if isinstance(sharding_spec, jax.sharding.NamedSharding) else param,
-                state.graphstate,
-                state.shardings.graphstate
-            )
-            state = state.replace(graphstate=resharded_graphstate)
-        # MODIFICATION END
         return state, metrics
     else:
         _, metrics = loss_fn(tree=state.graphstate, minibatch=batch)
